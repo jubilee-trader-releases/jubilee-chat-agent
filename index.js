@@ -1,7 +1,12 @@
 'use strict';
 
-const fs   = require('fs');
-const path = require('path');
+const fs      = require('fs');
+const path    = require('path');
+const https   = require('https');
+const express = require('express');
+const cors    = require('cors');
+
+// Load .env if present
 const envFile = path.join(__dirname, '.env');
 if (fs.existsSync(envFile)) {
   fs.readFileSync(envFile, 'utf-8').split(/\r?\n/).forEach(line => {
@@ -10,12 +15,8 @@ if (fs.existsSync(envFile)) {
   });
 }
 
-const express = require('express');
-const cors    = require('cors');
-const Groq    = require('groq-sdk');
-
-const PORT   = Number(process.env.PORT) || 3300;
-const client = new Groq({ apiKey: process.env.GROQ_API_KEY });
+const PORT    = Number(process.env.PORT) || 3300;
+const API_KEY = (process.env.GROQ_API_KEY || '').trim();
 
 // ── System prompt ─────────────────────────────────────────────────────────────
 const SYSTEM = `You are Jubi, the AI assistant for Jubilee Trader — an autonomous algorithmic paper trading platform built in Node.js.
@@ -69,7 +70,6 @@ STRATEGY CARDS (9 cards — 3 per asset class, selected dynamically by the Marke
 PAPER PERFORMANCE (91-trade analysis, May 2026)
   Overall: 50.5% win rate, Profit Factor 1.60, Net +$6,241
   Best performing signal: CR-A (crypto) — Profit Factor 2.90
-  Pre-engine-upgrade (71 trades): PF 1.82, +$5,219
   Key improvement made: 64% of losses hit SL within 6 hours, so an early abort gate was added
 
 ACCESS
@@ -83,51 +83,86 @@ RESPONSE RULES
 - For pricing or access questions, direct to the "Get Access" button on the site
 - If asked something outside Jubilee Trader, politely redirect`;
 
+// ── Direct Groq REST call with streaming ─────────────────────────────────────
+function callGroq(messages, onChunk, onEnd, onError) {
+  const body = JSON.stringify({
+    model:      'llama-3.1-8b-instant',
+    max_tokens: 1024,
+    stream:     true,
+    messages:   [{ role: 'system', content: SYSTEM }, ...messages],
+  });
+
+  const options = {
+    hostname: 'api.groq.com',
+    path:     '/openai/v1/chat/completions',
+    method:   'POST',
+    headers:  {
+      'Authorization': `Bearer ${API_KEY}`,
+      'Content-Type':  'application/json',
+      'Content-Length': Buffer.byteLength(body),
+    },
+  };
+
+  const req = https.request(options, res => {
+    if (res.statusCode !== 200) {
+      let errBody = '';
+      res.on('data', d => errBody += d);
+      res.on('end', () => onError(new Error(`Groq ${res.statusCode}: ${errBody}`)));
+      return;
+    }
+
+    res.on('data', chunk => {
+      const lines = chunk.toString().split('\n');
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed || trimmed === 'data: [DONE]') continue;
+        if (!trimmed.startsWith('data: ')) continue;
+        try {
+          const json  = JSON.parse(trimmed.slice(6));
+          const text  = json.choices?.[0]?.delta?.content;
+          if (text) onChunk(text);
+        } catch (_) {}
+      }
+    });
+    res.on('end', onEnd);
+    res.on('error', onError);
+  });
+
+  req.on('error', onError);
+  req.write(body);
+  req.end();
+}
+
+// ── Express app ───────────────────────────────────────────────────────────────
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: '32kb' }));
 
-// ── Chat endpoint ─────────────────────────────────────────────────────────────
-app.post('/api/chat', async (req, res) => {
+app.post('/api/chat', (req, res) => {
   const msgs = req.body?.messages;
   if (!Array.isArray(msgs) || msgs.length === 0) {
     return res.status(400).json({ error: 'messages array required' });
   }
-
-  // Keep last 20 turns
-  const trimmed = msgs.slice(-20);
+  if (!API_KEY) {
+    return res.status(500).json({ error: 'GROQ_API_KEY not configured' });
+  }
 
   res.setHeader('Content-Type', 'text/plain; charset=utf-8');
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('X-Accel-Buffering', 'no');
 
-  try {
-    const stream = await client.chat.completions.create({
-      model:      'llama-3.1-8b-instant',
-      max_tokens: 1024,
-      messages:   [{ role: 'system', content: SYSTEM }, ...trimmed],
-      stream:     true,
-    });
-
-    for await (const chunk of stream) {
-      const text = chunk.choices[0]?.delta?.content;
-      if (text) res.write(text);
+  callGroq(
+    msgs.slice(-20),
+    text  => res.write(text),
+    ()    => res.end(),
+    err   => {
+      console.error('[chat-agent]', err.message);
+      if (!res.headersSent) res.status(500).json({ error: err.message });
+      else res.end();
     }
-
-    res.end();
-  } catch (err) {
-    console.error('[chat-agent]', err.message, err.status, err.error);
-    if (!res.headersSent) {
-      res.status(500).json({ error: err.message || 'Unknown error', status: err.status, detail: err.error });
-    } else {
-      res.end();
-    }
-  }
+  );
 });
 
-// ── Health check ──────────────────────────────────────────────────────────────
-app.get('/health', (_req, res) => res.json({ ok: true }));
+app.get('/health', (_req, res) => res.json({ ok: true, key: API_KEY ? 'set' : 'missing' }));
 
-app.listen(PORT, () =>
-  console.log(`Jubi chat agent -> http://localhost:${PORT}`)
-);
+app.listen(PORT, () => console.log(`Jubi chat agent -> http://localhost:${PORT}`));
