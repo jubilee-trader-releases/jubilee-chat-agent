@@ -16,7 +16,9 @@ if (fs.existsSync(envFile)) {
 }
 
 const PORT    = Number(process.env.PORT) || 3300;
-const API_KEY = (process.env.GROQ_API_KEY || '').trim();
+// Prefer Gemini; fall back to GROQ var name so existing Render config keeps working
+const API_KEY = (process.env.GEMINI_API_KEY || process.env.GROQ_API_KEY || '').trim();
+const MODEL   = (process.env.GEMINI_MODEL || 'gemini-2.5-flash').trim();
 
 // ── System prompt ─────────────────────────────────────────────────────────────
 const SYSTEM = `You are Jubi, the AI assistant for Jubilee Trader — an autonomous algorithmic paper trading platform built in Node.js.
@@ -71,27 +73,31 @@ RESPONSE RULES
 - Paper trading only — no live broker connected
 - Redirect off-topic questions back to Jubilee Trader`;
 
-// ── Groq REST call (non-streaming, reliable) ─────────────────────────────────
-function callGroq(messages) {
+// ── Gemini REST call (non-streaming) ─────────────────────────────────────────
+function callLLM(messages) {
   return new Promise((resolve, reject) => {
-    // Drop empty / malformed turns and keep history short to conserve tokens
+    // Drop empty / malformed turns and keep history short
     const clean = messages
       .filter(m => m && typeof m.content === 'string' && m.content.trim())
       .slice(-6);
 
+    // Gemini uses "user"/"model" roles and a separate systemInstruction
+    const contents = clean.map(m => ({
+      role:  m.role === 'assistant' ? 'model' : 'user',
+      parts: [{ text: m.content.trim() }],
+    }));
+
     const body = JSON.stringify({
-      model:      'llama-3.1-8b-instant',
-      max_tokens: 500,
-      stream:     false,
-      messages:   [{ role: 'system', content: SYSTEM }, ...clean],
+      systemInstruction: { parts: [{ text: SYSTEM }] },
+      contents,
+      generationConfig: { maxOutputTokens: 1024, temperature: 0.7 },
     });
 
     const options = {
-      hostname: 'api.groq.com',
-      path:     '/openai/v1/chat/completions',
+      hostname: 'generativelanguage.googleapis.com',
+      path:     `/v1beta/models/${MODEL}:generateContent?key=${API_KEY}`,
       method:   'POST',
       headers:  {
-        'Authorization':  `Bearer ${API_KEY}`,
         'Content-Type':   'application/json',
         'Content-Length': Buffer.byteLength(body),
       },
@@ -104,12 +110,13 @@ function callGroq(messages) {
         try {
           const json = JSON.parse(data);
           if (res.statusCode !== 200) {
-            reject(new Error(json.error?.message || `Groq ${res.statusCode}`));
-          } else {
-            resolve(json.choices[0].message.content);
+            return reject(new Error(json.error?.message || `Gemini ${res.statusCode}`));
           }
+          const text = json.candidates?.[0]?.content?.parts?.[0]?.text;
+          if (!text) return reject(new Error('Empty response from Gemini'));
+          resolve(text);
         } catch (e) {
-          reject(new Error('Invalid response from Groq'));
+          reject(new Error('Invalid response from Gemini'));
         }
       });
       res.on('error', reject);
@@ -136,7 +143,7 @@ app.post('/api/chat', async (req, res) => {
   }
 
   try {
-    const text = await callGroq(msgs.slice(-20));
+    const text = await callLLM(msgs.slice(-20));
     res.setHeader('Content-Type', 'text/plain; charset=utf-8');
     res.send(text);
   } catch (err) {
