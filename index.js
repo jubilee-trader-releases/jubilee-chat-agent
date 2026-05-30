@@ -74,11 +74,16 @@ RESPONSE RULES
 // ── Groq REST call (non-streaming, reliable) ─────────────────────────────────
 function callGroq(messages) {
   return new Promise((resolve, reject) => {
+    // Drop empty / malformed turns and keep history short to conserve tokens
+    const clean = messages
+      .filter(m => m && typeof m.content === 'string' && m.content.trim())
+      .slice(-6);
+
     const body = JSON.stringify({
       model:      'llama-3.1-8b-instant',
-      max_tokens: 1024,
+      max_tokens: 500,
       stream:     false,
-      messages:   [{ role: 'system', content: SYSTEM }, ...messages],
+      messages:   [{ role: 'system', content: SYSTEM }, ...clean],
     });
 
     const options = {
@@ -136,6 +141,11 @@ app.post('/api/chat', async (req, res) => {
     res.send(text);
   } catch (err) {
     console.error('[chat-agent]', err.message);
+    if (/rate limit|tokens per day|TPD/i.test(err.message)) {
+      return res
+        .status(429)
+        .send("Jubi has hit today's free message limit — please try again later or check back tomorrow.");
+    }
     res.status(500).json({ error: err.message });
   }
 });
