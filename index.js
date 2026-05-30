@@ -116,9 +116,9 @@ app.post('/api/chat', async (req, res) => {
 
     res.end();
   } catch (err) {
-    console.error('[chat-agent]', err.message);
+    console.error('[chat-agent]', err.message, err.status, err.error);
     if (!res.headersSent) {
-      res.status(500).json({ error: 'Agent unavailable — check GROQ_API_KEY' });
+      res.status(500).json({ error: err.message || 'Unknown error', status: err.status, detail: err.error });
     } else {
       res.end();
     }
